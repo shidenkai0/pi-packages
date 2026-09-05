@@ -1,0 +1,5 @@
+{
+  "$schema": "../schemas/config.schema.json",
+  "includeBaselinePolicy": true,
+  "denialAction": "ask"
+}

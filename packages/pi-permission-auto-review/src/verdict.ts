@@ -37,7 +37,7 @@ export function parseReviewAssessment(text: string): ReviewAssessment {
     payload.rationale ??
     (payload.outcome === 'allow'
       ? 'Automatic review returned a low-risk allow decision.'
-      : 'The review returned no rationale.')
+      : 'Automatic review returned a deny decision without a rationale.')
 
   return {
     riskLevel,

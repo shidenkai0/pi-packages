@@ -32,6 +32,7 @@ export interface TranscriptStats {
 
 export interface RenderedTranscript {
   entries: string[]
+  omittedCount: number
   stats: TranscriptStats
 }
 
@@ -81,8 +82,7 @@ function truncateToCharacters(text: string, maxCharacters: number): string {
   const available = Math.max(0, maxCharacters - tag.length)
   const headLength = Math.floor(available * 0.7)
   const tailLength = available - headLength
-  // `slice(-0)` is `slice(0)`, which would return the whole string when the budget leaves no tail.
-  return `${text.slice(0, headLength)}${tag}${text.slice(text.length - tailLength)}`
+  return `${text.slice(0, headLength)}${tag}${text.slice(-tailLength)}`
 }
 
 export function truncateToApproximateTokens(text: string, maxTokens: number): string {
@@ -430,6 +430,7 @@ export function renderTranscript(sessionEntries: SessionEntry[]): RenderedTransc
 
   return {
     entries: retained.map(renderTranscriptEntry),
+    omittedCount: stats.transcriptEntriesOmitted,
     stats,
   }
 }

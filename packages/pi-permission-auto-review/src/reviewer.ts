@@ -12,8 +12,8 @@ import { buildReviewPrompt } from './prompt.js'
 import { renderTranscript } from './transcript.js'
 import { parseReviewAssessment } from './verdict.js'
 
-const RETRY_DELAYS_MS = [250, 1_000]
-const MAX_ATTEMPTS = RETRY_DELAYS_MS.length + 1
+const DEFAULT_MAX_ATTEMPTS = 3
+const DEFAULT_RETRY_DELAYS_MS = [250, 1_000]
 const MAX_OUTPUT_TOKENS = 1_000
 const DECISION_EVENT = 'auto_review.decision'
 const FAILURE_EVENT = 'auto_review.failure'
@@ -35,12 +35,17 @@ export interface ReviewerRuntime {
   sessionManager: Pick<SessionManager, 'getBranch'>
   circuitBreaker: DenialCircuitBreaker
   sessionSignal?: AbortSignal
+  /** True only for an interactive TUI; RPC clients must decide their own asks. */
+  isInteractive?: () => boolean
+  /** Advisory notification only. Approval is owned by the permission system. */
+  notifyHuman?: (message: string) => void
 }
 
-/** The clock and timer, injectable so a test does not wait out a real retry delay. */
 export interface ReviewerDependencies {
   now?: () => number
   sleep?: (milliseconds: number, signal: AbortSignal) => Promise<void>
+  maxAttempts?: number
+  retryDelaysMs?: number[]
 }
 
 interface ContextDiagnostics extends TranscriptStats {
@@ -56,6 +61,14 @@ interface Failure {
 interface ReviewCallResult {
   assessment: ReviewAssessment
   contextDiagnostics: ContextDiagnostics
+}
+
+function buildContextDiagnostics(stats: TranscriptStats): ContextDiagnostics {
+  return {
+    policyRevision: POLICY_REVISION,
+    contextSource: 'active-branch',
+    ...stats,
+  }
 }
 
 function abortError(): Error {
@@ -189,10 +202,32 @@ function writeFailure(
   log.debug(FAILURE_EVENT, common)
 }
 
+function tryWriteFailure(
+  log: AuthorizerLog,
+  runtime: ReviewerRuntime,
+  details: PromptPermissionDetails,
+  failure: Failure,
+  durationMs: number,
+): void {
+  try {
+    writeFailure(log, runtime, details, failure, durationMs)
+  } catch {
+    // Permission review failures must not escape into the fail-closed tool boundary.
+  }
+}
+
+function elapsedMilliseconds(now: () => number, startedAt: number): number {
+  try {
+    return Math.max(0, now() - startedAt)
+  } catch {
+    return 0
+  }
+}
+
 async function runReview(
   runtime: ReviewerRuntime,
   details: PromptPermissionDetails,
-  dependencies: Required<ReviewerDependencies>,
+  dependencies: Required<Pick<ReviewerDependencies, 'now' | 'sleep' | 'maxAttempts' | 'retryDelaysMs'>>,
 ): Promise<ReviewCallResult | Failure> {
   const startedAt = dependencies.now()
   const timeoutController = new AbortController()
@@ -204,11 +239,7 @@ async function runReview(
 
   try {
     const transcript = renderTranscript(runtime.sessionManager.getBranch())
-    const contextDiagnostics: ContextDiagnostics = {
-      policyRevision: POLICY_REVISION,
-      contextSource: 'active-branch',
-      ...transcript.stats,
-    }
+    const contextDiagnostics = buildContextDiagnostics(transcript.stats)
     const failure = (category: FailureCategory): Failure => ({ category, contextDiagnostics })
     const resolved = resolveReviewModel(runtime.registry, runtime.config)
     if (!resolved.ok) {
@@ -230,7 +261,7 @@ async function runReview(
 
     const prompt = buildReviewPrompt(runtime.config, transcript, details)
 
-    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {
+    for (let attempt = 1; attempt <= dependencies.maxAttempts; attempt += 1) {
       try {
         const remainingMs = Math.max(1, runtime.config.timeoutMs - (dependencies.now() - startedAt))
         const message = await raceWithSignal(
@@ -260,11 +291,12 @@ async function runReview(
         if (signal.aborted) {
           return failure(timeoutController.signal.aborted ? 'timeout' : 'cancelled')
         }
-        if (attempt >= MAX_ATTEMPTS) {
+        if (attempt >= dependencies.maxAttempts) {
           return failure('provider-error')
         }
+        const delay = dependencies.retryDelaysMs[attempt - 1] ?? dependencies.retryDelaysMs.at(-1) ?? 0
         try {
-          await dependencies.sleep(RETRY_DELAYS_MS[attempt - 1] ?? 0, signal)
+          await dependencies.sleep(delay, signal)
         } catch {
           return failure(timeoutController.signal.aborted ? 'timeout' : 'cancelled')
         }
@@ -280,33 +312,68 @@ export function createPermissionReviewer(
   runtime: ReviewerRuntime,
   reviewerDependencies: ReviewerDependencies = {},
 ): Authorizer['authorize'] {
-  const dependencies: Required<ReviewerDependencies> = {
+  const dependencies = {
     now: reviewerDependencies.now ?? Date.now,
     sleep: reviewerDependencies.sleep ?? defaultSleep,
+    maxAttempts: reviewerDependencies.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+    retryDelaysMs: reviewerDependencies.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS,
+  }
+
+  function notifyHuman(details: PromptPermissionDetails, reason: string): void {
+    // Model text is untrusted presentation content. Remove terminal controls;
+    // never persist rationale/transcript content in the review log.
+    const plain = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
+    try {
+      runtime.notifyHuman?.(
+        `Automatic review needs a human decision [${plain(details.requestId)}].\n` +
+          `${plain(reason)}\nReview the proposed action in the permission prompt.`,
+      )
+    } catch {
+      // Notification failure must neither alter the breaker nor block delegation.
+    }
   }
 
   return async (details, _query, log) => {
-    const startedAt = dependencies.now()
+    let startedAt = 0
     try {
+      startedAt = dependencies.now()
+      if (runtime.isInteractive?.() !== true) {
+        log.review(DECISION_EVENT, {
+          requestId: details.requestId,
+          outcome: 'defer',
+          errorCategory: 'interactive-review-unavailable',
+        })
+        return { kind: 'defer' }
+      }
       if (runtime.circuitBreaker.isOpen()) {
         const reason =
-          'Too many denials this turn; further requests are refused unreviewed until the next turn. Ask the user for explicit approval before retrying'
+          'Automatic permission review rejected too many requests in this turn. Ask the user for explicit approval before retrying.'
         log.review(CIRCUIT_OPEN_EVENT, {
           requestId: details.requestId,
           provider: runtime.config.provider,
           model: runtime.config.model,
-          outcome: 'deny',
+          outcome: runtime.config.denialAction === 'ask' ? 'defer' : 'deny',
           durationMs: 0,
           errorCategory: 'circuit-open',
         })
+        if (runtime.config.denialAction === 'ask') {
+          notifyHuman(
+            details,
+            'Automatic review paused after repeated model denials this turn. This action has not been reviewed; a human decision is required.',
+          )
+          return { kind: 'defer' }
+        }
         return { kind: 'deny', reason }
       }
 
       const result = await runReview(runtime, details, dependencies)
-      const durationMs = Math.max(0, dependencies.now() - startedAt)
+      const durationMs = elapsedMilliseconds(dependencies.now, startedAt)
       if ('category' in result) {
         runtime.circuitBreaker.recordNonDenial()
         writeFailure(log, runtime, details, result, durationMs)
+        if (runtime.config.denialAction === 'ask') {
+          notifyHuman(details, `Automatic review could not decide (${result.category}). A human decision is required.`)
+        }
         return { kind: 'defer' }
       }
 
@@ -317,29 +384,46 @@ export function createPermissionReviewer(
         model: runtime.config.model,
         riskLevel: assessment.riskLevel,
         userAuthorization: assessment.userAuthorization,
-        outcome: assessment.outcome,
+        outcome: assessment.outcome === 'deny' && runtime.config.denialAction === 'ask' ? 'defer' : assessment.outcome,
+        modelOutcome: assessment.outcome,
         durationMs,
         ...contextDiagnostics,
       })
 
       if (assessment.outcome === 'allow') {
         runtime.circuitBreaker.recordNonDenial()
+        if (runtime.sessionSignal?.aborted || runtime.isInteractive?.() !== true) return { kind: 'defer' }
         return { kind: 'allow' }
       }
 
       runtime.circuitBreaker.recordDenied()
-      // The reason is rendered after the host's own attribution sentence
-      // ("The 'auto-review' authorizer denied this ..."), so it carries only
-      // what that sentence does not: why, and the two grades behind the call.
+      if (runtime.config.denialAction === 'ask') {
+        notifyHuman(
+          details,
+          `Model assessment (advisory): ${assessment.rationale} (risk: ${assessment.riskLevel}, authorization: ${assessment.userAuthorization}).`,
+        )
+        return { kind: 'defer' }
+      }
       return {
         kind: 'deny',
-        reason: `${assessment.rationale} (risk: ${assessment.riskLevel}, user authorization: ${assessment.userAuthorization})`,
+        reason: `Automatic permission review denied this action (risk: ${assessment.riskLevel}, authorization: ${assessment.userAuthorization}): ${assessment.rationale}`,
       }
     } catch {
-      // The chain does not isolate a link that throws, so every internal failure
-      // has to leave here as a verdict.
-      runtime.circuitBreaker.recordNonDenial()
-      writeFailure(log, runtime, details, { category: 'internal-error' }, Math.max(0, dependencies.now() - startedAt))
+      try {
+        runtime.circuitBreaker.recordNonDenial()
+      } catch {
+        // Returning defer remains the safe fallback even if local state is unavailable.
+      }
+      tryWriteFailure(
+        log,
+        runtime,
+        details,
+        { category: 'internal-error' },
+        elapsedMilliseconds(dependencies.now, startedAt),
+      )
+      if (runtime.config.denialAction === 'ask') {
+        notifyHuman(details, 'Automatic review could not decide (internal-error). A human decision is required.')
+      }
       return { kind: 'defer' }
     }
   }

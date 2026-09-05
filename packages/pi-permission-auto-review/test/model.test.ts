@@ -1,7 +1,7 @@
 import type { ReviewModelRegistry } from '../src/model.js'
 import type { Api, Model, Provider } from '@earendil-works/pi-ai'
 import { describe, expect, it, vi } from 'vitest'
-import { DEFAULT_CONFIG } from '../src/config.js'
+import { autoReviewConfigSchema } from '../src/config.js'
 import { resolveReviewModel } from '../src/model.js'
 
 function model(overrides: Partial<Model<Api>> = {}): Model<Api> {
@@ -44,11 +44,12 @@ describe('resolveReviewModel', () => {
       getModels: () => [template],
     } as unknown as Provider
 
-    const result = resolveReviewModel(registry([template], provider), DEFAULT_CONFIG)
+    const result = resolveReviewModel(registry([template], provider), autoReviewConfigSchema.parse({}))
 
     expect(result).toMatchObject({
       ok: true,
       value: {
+        synthesized: true,
         model: {
           id: 'codex-auto-review',
           api: 'openai-codex-responses',
@@ -64,7 +65,10 @@ describe('resolveReviewModel', () => {
       id: 'custom',
       getModels: () => [],
     } as unknown as Provider
-    const config = { ...DEFAULT_CONFIG, provider: 'custom', model: 'codex-auto-review' }
+    const config = autoReviewConfigSchema.parse({
+      provider: 'custom',
+      model: 'codex-auto-review',
+    })
 
     expect(resolveReviewModel(registry([], provider), config)).toEqual({
       ok: false,

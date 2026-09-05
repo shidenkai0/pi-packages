@@ -17,9 +17,9 @@ function normalizePermissionDetails(details: PromptPermissionDetails): Record<st
     'requestId',
     'source',
     'agentName',
-    // The complete structured description of the ask (ADR 0011 §2), which
-    // replaced the pre-rendered `message` sentence in 26.0.0. Every consumer is
-    // a render over it; this one elides under MAX_ACTION_TOKENS below.
+    'message',
+    // Permission-system 26 replaced `message` with a structured payload.
+    // Keep the legacy field for 20.x callers, and preserve current action evidence.
     'payload',
     'toolCallId',
     'toolName',
@@ -37,7 +37,7 @@ function normalizePermissionDetails(details: PromptPermissionDetails): Record<st
   ] as const
 
   for (const field of fields) {
-    const value = details[field]
+    const value = (details as PromptPermissionDetails & { message?: string })[field]
     if (value !== undefined) {
       normalized[field] = value
     }
@@ -54,8 +54,10 @@ export function buildReviewPrompt(
     transcript.entries.length > 0
       ? transcript.entries.join('\n')
       : JSON.stringify({ source: 'metadata', retainedEntries: 0 })
-  const omittedEntries = transcript.stats.transcriptEntriesOmitted
-  const omission = omittedEntries > 0 ? `\n${JSON.stringify({ source: 'metadata', omittedEntries })}` : ''
+  const omission =
+    transcript.omittedCount > 0
+      ? `\n${JSON.stringify({ source: 'metadata', omittedEntries: transcript.omittedCount })}`
+      : ''
   const action = truncateToApproximateTokens(
     JSON.stringify(normalizePermissionDetails(details), null, 2),
     MAX_ACTION_TOKENS,

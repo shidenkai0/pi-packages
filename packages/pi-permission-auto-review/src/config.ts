@@ -8,11 +8,35 @@ export const EXTENSION_ID = 'pi-permission-auto-review'
 export const AUTHORIZER_NAME = 'auto-review'
 export const DEFAULT_PROVIDER = 'openai-codex'
 export const DEFAULT_MODEL = 'codex-auto-review'
-const DEFAULT_TIMEOUT_MS = 90_000
+export const DEFAULT_TIMEOUT_MS = 90_000
 export const CONFIG_SCHEMA_URL =
   'https://raw.githubusercontent.com/mzwing/pi-packages/main/packages/pi-permission-auto-review/schemas/config.schema.json'
 
 export const REASONING_LEVELS = ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const
+
+type AutoReviewConfigSchema = z.ZodObject<
+  {
+    $schema: z.ZodOptional<z.ZodString>
+    additionalPolicy: z.ZodOptional<z.ZodString>
+    provider: z.ZodDefault<z.ZodString>
+    model: z.ZodDefault<z.ZodString>
+    reasoning: z.ZodDefault<
+      z.ZodEnum<{
+        off: 'off'
+        minimal: 'minimal'
+        low: 'low'
+        medium: 'medium'
+        high: 'high'
+        xhigh: 'xhigh'
+        max: 'max'
+      }>
+    >
+    timeoutMs: z.ZodDefault<z.ZodNumber>
+    includeBaselinePolicy: z.ZodDefault<z.ZodBoolean>
+    denialAction: z.ZodDefault<z.ZodEnum<{ deny: 'deny'; ask: 'ask' }>>
+  },
+  z.core.$strict
+>
 
 const configFileShape = {
   $schema: z.string().min(1).optional(),
@@ -21,12 +45,13 @@ const configFileShape = {
   reasoning: z.enum(REASONING_LEVELS).optional(),
   timeoutMs: z.number().int().positive().max(300_000).optional(),
   includeBaselinePolicy: z.boolean().optional(),
+  denialAction: z.enum(['deny', 'ask']).optional(),
   additionalPolicy: z.string().trim().min(1).optional(),
 }
 
 const autoReviewConfigFileSchema = z.strictObject(configFileShape)
 
-const autoReviewConfigSchema = z
+export const autoReviewConfigSchema: AutoReviewConfigSchema = z
   .strictObject({
     ...configFileShape,
     provider: z.string().trim().min(1).default(DEFAULT_PROVIDER),
@@ -34,6 +59,7 @@ const autoReviewConfigSchema = z
     reasoning: z.enum(REASONING_LEVELS).default('low'),
     timeoutMs: z.number().int().positive().max(300_000).default(DEFAULT_TIMEOUT_MS),
     includeBaselinePolicy: z.boolean().default(true),
+    denialAction: z.enum(['deny', 'ask']).default('deny'),
   })
   .superRefine((config, context) => {
     if (!config.includeBaselinePolicy && config.additionalPolicy === undefined) {
@@ -45,21 +71,7 @@ const autoReviewConfigSchema = z
     }
   })
 
-/**
- * Hand-written because `isolatedDeclarations` cannot emit a `z.infer` of a module-private schema.
- * `DEFAULT_CONFIG` below is the assignability check that keeps the two in step.
- */
-export interface AutoReviewConfig {
-  $schema?: string | undefined
-  provider: string
-  model: string
-  reasoning: (typeof REASONING_LEVELS)[number]
-  timeoutMs: number
-  includeBaselinePolicy: boolean
-  additionalPolicy?: string | undefined
-}
-
-export const DEFAULT_CONFIG: AutoReviewConfig = autoReviewConfigSchema.parse({})
+export type AutoReviewConfig = z.infer<typeof autoReviewConfigSchema>
 
 export interface AutoReviewConfigFile {
   $schema?: string | undefined
@@ -68,6 +80,7 @@ export interface AutoReviewConfigFile {
   reasoning?: (typeof REASONING_LEVELS)[number] | undefined
   timeoutMs?: number | undefined
   includeBaselinePolicy?: boolean | undefined
+  denialAction?: 'deny' | 'ask' | undefined
   additionalPolicy?: string | undefined
 }
 
@@ -112,8 +125,7 @@ export function getAutoReviewConfigPaths(
   }
 }
 
-/** Reads a config file, reporting a missing one as `undefined` rather than an error. */
-export function readConfigFile(path: string): string | undefined {
+function defaultReadFile(path: string): string | undefined {
   try {
     return readFileSync(path, 'utf8')
   } catch (error) {
@@ -193,7 +205,7 @@ function readScope(
 
 export function loadAutoReviewConfig(options: LoadConfigOptions): LoadConfigResult {
   const { globalPath, projectPath } = getAutoReviewConfigPaths(options.cwd, options.agentDir)
-  const readFile = options.readFile ?? readConfigFile
+  const readFile = options.readFile ?? defaultReadFile
   const issues: ConfigIssue[] = []
   const globalConfig = readScope(globalPath, readFile, issues)
   const projectConfig = readScope(projectPath, readFile, issues)
