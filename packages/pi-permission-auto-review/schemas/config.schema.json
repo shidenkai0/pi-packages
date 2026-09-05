@@ -20,7 +20,15 @@
     "reasoning": {
       "default": "low",
       "type": "string",
-      "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+      "enum": [
+        "off",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
     },
     "timeoutMs": {
       "default": 90000,
@@ -31,6 +39,14 @@
     "includeBaselinePolicy": {
       "default": true,
       "type": "boolean"
+    },
+    "denialAction": {
+      "default": "deny",
+      "type": "string",
+      "enum": [
+        "deny",
+        "ask"
+      ]
     },
     "additionalPolicy": {
       "type": "string",
@@ -46,10 +62,14 @@
             "const": false
           }
         },
-        "required": ["includeBaselinePolicy"]
+        "required": [
+          "includeBaselinePolicy"
+        ]
       },
       "then": {
-        "required": ["additionalPolicy"]
+        "required": [
+          "additionalPolicy"
+        ]
       }
     }
   ]

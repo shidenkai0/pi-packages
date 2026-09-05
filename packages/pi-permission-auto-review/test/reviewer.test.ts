@@ -8,16 +8,13 @@ import type {
   SimpleStreamOptions,
 } from '@earendil-works/pi-ai'
 import type { SessionEntry } from '@earendil-works/pi-coding-agent'
-import type {
-  AuthorizerLog,
-  PermissionQuery,
-  PromptPayload,
-  PromptPermissionDetails,
-} from '@gotgenes/pi-permission-system'
+import type { AuthorizerLog, PermissionQuery, PromptPermissionDetails } from '@gotgenes/pi-permission-system'
+import { ModelRegistry } from '@earendil-works/pi-coding-agent'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { DenialCircuitBreaker } from '../src/circuit-breaker.js'
-import { DEFAULT_CONFIG } from '../src/config.js'
+import { autoReviewConfigSchema } from '../src/config.js'
 import { createPermissionReviewer } from '../src/reviewer.js'
+import { promptPayload } from './prompt-payload.js'
 
 function createModel(): Model<Api> {
   return {
@@ -136,25 +133,6 @@ function userInteractionEntries(): SessionEntry[] {
   ]
 }
 
-function promptPayload(overrides: Partial<PromptPayload> = {}): PromptPayload {
-  return {
-    kind: 'bash',
-    request: {
-      requester: { agentName: null, forwarded: false, sessionId: null },
-      surface: 'bash',
-      toolName: 'bash',
-      invokedToolName: null,
-      value: 'pnpm publish',
-      matchedPattern: 'pnpm publish*',
-      commandContext: null,
-      executedUnit: null,
-    },
-    evidence: [{ label: 'command', text: 'pnpm publish', detail: null }],
-    annotations: [],
-    ...overrides,
-  }
-}
-
 function details(overrides: Partial<PromptPermissionDetails> = {}): PromptPermissionDetails {
   return {
     requestId: 'request-1',
@@ -185,7 +163,7 @@ interface HarnessOptions {
   auth?: Awaited<ReturnType<ReviewModelRegistry['getApiKeyAndHeaders']>>
   timeoutMs?: number
   resultFactory?: (options: SimpleStreamOptions) => Promise<AssistantMessage>
-  providerLookup?: 'native' | 'missing' | 'throwing'
+  providerLookup?: 'native' | 'legacy' | 'missing' | 'throwing'
   sessionEntries?: SessionEntry[]
 }
 
@@ -230,13 +208,28 @@ function createHarness(options: HarnessOptions = {}) {
     getAll: vi.fn(() => [model]),
     getApiKeyAndHeaders,
   }
+  const providerLookup = vi.fn(() => provider)
   let registry: ReviewModelRegistry
   switch (options.providerLookup ?? 'native') {
     case 'native':
-      registry = { ...registryBase, getProvider: vi.fn(() => provider) }
+      registry = { ...registryBase, getProvider: providerLookup }
+      break
+    case 'legacy':
+      registry = new ModelRegistry({
+        getProvider: providerLookup,
+        getModel: vi.fn(() => model),
+        getModels: vi.fn(() => [model]),
+        getAuth: vi.fn(async () => ({
+          auth: {
+            apiKey: 'secret-key',
+            headers: { 'x-review': 'enabled' },
+          },
+          env: { REVIEW_REGION: 'test' },
+        })),
+      } as never)
       break
     case 'missing':
-      registry = { ...registryBase, getProvider: vi.fn(() => undefined) }
+      registry = registryBase
       break
     case 'throwing':
       registry = {
@@ -251,18 +244,19 @@ function createHarness(options: HarnessOptions = {}) {
   const getBranch = vi.fn(() => options.sessionEntries ?? [userEntry()])
   const authorize = createPermissionReviewer(
     {
-      config: {
-        ...DEFAULT_CONFIG,
+      config: autoReviewConfigSchema.parse({
         provider: 'custom-review',
         model: 'review-model',
         timeoutMs: options.timeoutMs ?? 90_000,
-      },
+      }),
       registry,
       sessionManager: { getBranch },
       circuitBreaker,
+      isInteractive: () => true,
     },
     {
       now: () => 0,
+      retryDelaysMs: [0, 0],
       sleep: async () => Promise.resolve(),
     },
   )
@@ -272,6 +266,7 @@ function createHarness(options: HarnessOptions = {}) {
     circuitBreaker,
     getApiKeyAndHeaders,
     getBranch,
+    registry,
     streamSimple,
   }
 }
@@ -310,7 +305,7 @@ describe('permission reviewer', () => {
       reasoning: 'low',
     })
     expect(log.review.mock.calls[0]?.[1]).toMatchObject({
-      policyRevision: 'openai-codex/6478a751fde8884b2fdc76486fe23175a8e795d4+pi1',
+      policyRevision: 'openai-codex/c4f42d161ae44a8d696ee9fb595709661979d187+pi1',
       contextSource: 'active-branch',
       transcriptEntriesRetained: 1,
       transcriptEntriesOmitted: 0,
@@ -343,30 +338,15 @@ describe('permission reviewer', () => {
     expect(userPrompt).not.toContain('untrusted presentation text')
   })
 
-  it('sends the structured prompt payload as the permission request', async () => {
-    const harness = createHarness()
+  it('uses the Pi 0.80.10 provider lookup polyfill', async () => {
+    const harness = createHarness({ providerLookup: 'legacy' })
 
-    await expect(
-      harness.authorize(
-        details({
-          payload: promptPayload({
-            evidence: [{ label: 'command', text: 'pnpm publish', detail: 'runs from /project' }],
-            annotations: [{ source: 'risk-annotator', text: 'publishes to a public registry' }],
-          }),
-        }),
-        query,
-        createLog(),
-      ),
-    ).resolves.toEqual({ kind: 'allow' })
-
-    const [, context] = harness.streamSimple.mock.calls[0] ?? []
-    const userPrompt = (context as { messages: Array<{ content: string }> }).messages[0]?.content
-    const request = userPrompt?.split('>>> PERMISSION REQUEST START')[1]
-
-    expect(request).toContain('"kind": "bash"')
-    expect(request).toContain('"matchedPattern": "pnpm publish*"')
-    expect(request).toContain('"detail": "runs from /project"')
-    expect(request).toContain('"source": "risk-annotator"')
+    expect(harness.registry).toBeInstanceOf(ModelRegistry)
+    expect('getProvider' in harness.registry).toBe(false)
+    await expect(harness.authorize(details(), query, createLog())).resolves.toEqual({
+      kind: 'allow',
+    })
+    expect(harness.streamSimple).toHaveBeenCalledOnce()
   })
 
   it('returns a teaching denial without persisting the rationale', async () => {
@@ -440,6 +420,16 @@ describe('permission reviewer', () => {
     expect(throwingLog.review.mock.calls[0]?.[1]).toMatchObject({
       errorCategory: 'internal-error',
     })
+  })
+
+  it('defers when review logging throws', async () => {
+    const harness = createHarness()
+    const log = createLog()
+    log.review.mockImplementation(() => {
+      throw new Error('log unavailable')
+    })
+
+    await expect(harness.authorize(details(), query, log)).resolves.toEqual({ kind: 'defer' })
   })
 
   it('opens the per-turn circuit after three consecutive denials', async () => {

@@ -4,5 +4,6 @@
   "model": "codex-auto-review",
   "reasoning": "low",
   "timeoutMs": 90000,
-  "includeBaselinePolicy": true
+  "includeBaselinePolicy": true,
+  "denialAction": "deny"
 }

@@ -1,5 +1,5 @@
 import type { AutoReviewConfigFile, AutoReviewConfigPaths, ConfigIssue, LoadConfigResult } from './config.js'
-import { mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import {
   CONFIG_SCHEMA_URL,
@@ -7,7 +7,6 @@ import {
   getAutoReviewConfigPaths,
   loadAutoReviewConfig,
   parseAutoReviewConfigFile,
-  readConfigFile,
   validateAutoReviewConfigFile,
 } from './config.js'
 
@@ -30,7 +29,16 @@ export type AutoReviewScopeSnapshot =
       issue: ConfigIssue
     })
 
-export type ConfigMutationResult = { ok: true; loadResult: LoadConfigResult } | { ok: false; message: string }
+export type ConfigMutationResult =
+  | {
+      ok: true
+      loadResult: LoadConfigResult
+      snapshot: AutoReviewScopeSnapshot
+    }
+  | {
+      ok: false
+      message: string
+    }
 
 export interface AutoReviewConfigFileSystem {
   readFile: (path: string) => string | undefined
@@ -45,8 +53,21 @@ export interface AutoReviewConfigStoreOptions {
   fileSystem?: AutoReviewConfigFileSystem
 }
 
+function isNodeError(error: unknown, code: string): boolean {
+  return error instanceof Error && 'code' in error && error.code === code
+}
+
 const defaultFileSystem: AutoReviewConfigFileSystem = {
-  readFile: readConfigFile,
+  readFile(path) {
+    try {
+      return readFileSync(path, 'utf8')
+    } catch (error) {
+      if (isNodeError(error, 'ENOENT')) {
+        return undefined
+      }
+      throw error
+    }
+  },
   writeFile(path, source) {
     writeFileSync(path, source, 'utf8')
   },
@@ -66,7 +87,7 @@ function formatIssues(issues: ConfigIssue[]): string {
 }
 
 export class AutoReviewConfigStore {
-  private readonly agentDir: string
+  readonly agentDir: string
   private readonly fileSystem: AutoReviewConfigFileSystem
 
   constructor(options: AutoReviewConfigStoreOptions = {}) {
@@ -154,7 +175,18 @@ export class AutoReviewConfigStore {
       }
     }
 
-    return { ok: true, loadResult }
+    return {
+      ok: true,
+      loadResult,
+      snapshot: {
+        scope: snapshot.scope,
+        cwd: snapshot.cwd,
+        path: snapshot.path,
+        source,
+        valid: true,
+        config: parsed.config,
+      },
+    }
   }
 
   reset(snapshot: AutoReviewScopeSnapshot): ConfigMutationResult {
@@ -181,7 +213,19 @@ export class AutoReviewConfigStore {
       }
     }
 
-    return { ok: true, loadResult: this.loadWithOverride(snapshot, undefined) }
+    const loadResult = this.loadWithOverride(snapshot, undefined)
+    return {
+      ok: true,
+      loadResult,
+      snapshot: {
+        scope: snapshot.scope,
+        cwd: snapshot.cwd,
+        path: snapshot.path,
+        source: undefined,
+        valid: true,
+        config: {},
+      },
+    }
   }
 
   private loadWithOverride(snapshot: AutoReviewScopeSnapshot, source: string | undefined): LoadConfigResult {
@@ -212,8 +256,10 @@ export class AutoReviewConfigStore {
   private cleanupTempFile(tempPath: string): void {
     try {
       this.fileSystem.unlink(tempPath)
-    } catch {
-      // The original write error is more actionable than a best-effort cleanup failure.
+    } catch (error) {
+      if (!isNodeError(error, 'ENOENT')) {
+        // The original write error is more actionable than a best-effort cleanup failure.
+      }
     }
   }
 }
